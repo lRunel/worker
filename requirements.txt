@@ -1,0 +1,8 @@
+fastapi
+uvicorn==0.24.0
+torch
+torchvision
+requests==2.31.0
+tqdm==4.66.2
+psutil
+pyyaml
