@@ -3,7 +3,11 @@ import sys
 import time
 import uuid
 import requests
-import psutil
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 import threading
 import queue
 
@@ -26,9 +30,13 @@ class WorkerNode:
         self.controller_url = get_controller_url(controller_ip, controller_port)
         
         # System specs
-        self.cpu_cores = psutil.cpu_count(logical=True)
-        self.ram_mb = int(psutil.virtual_memory().total / (1024**2))
-        
+        if HAS_PSUTIL:
+            self.cpu_cores = psutil.cpu_count(logical=True)
+            self.ram_mb = int(psutil.virtual_memory().total / (1024**2))
+        else:
+            self.cpu_cores = os.cpu_count() or 4
+            self.ram_mb = 4096  # Assume 4GB as a safe fallback for mobile
+            
         # Try to infer device type
         if 'TERMUX_VERSION' in os.environ:
             self.device_type = "phone"
