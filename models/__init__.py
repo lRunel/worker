@@ -37,4 +37,4 @@ def list_models() -> list[dict]:
 
 
 # Import all architecture modules so they self-register on import
-from . import cnn, mlp, rnn, transformer, neural_net  # noqa: F401, E402
+from . import cnn, mlp, rnn, transformer, neural_net, cifar_cnn  # noqa: F401, E402

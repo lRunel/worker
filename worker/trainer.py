@@ -10,46 +10,48 @@ from models import get_model
 
 
 class Trainer:
-    def __init__(self, model_name: str, model_config: dict, model_state_dict: dict):
+    def __init__(self, model_name: str, model_config: dict, model_state_dict: dict, lr: float = 0.001):
         self.model = get_model(model_name, model_config)
         self.model.load_state_dict(model_state_dict)
         self.criterion = nn.CrossEntropyLoss()
+        self.lr = lr
 
     def train_steps(self, data: torch.Tensor, labels: torch.Tensor, steps: int):
         self.model.train()
         batch_size = 64  # must match controller
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
         # Shuffle received data for better gradient diversity
         perm = torch.randperm(len(data))
         data   = data[perm]
         labels = labels[perm]
 
-        self.model.zero_grad()
-        valid_steps = 0
+        # Snapshot weights before local training
+        old_state = [p.clone().detach() for p in self.model.parameters()]
 
+        n_samples = len(data)
         for step in range(steps):
-            start = step * batch_size
-            end   = start + batch_size
-            if start >= len(data):
-                break
-            batch_data   = data[start:end]
-            batch_labels = labels[start:end]
-            if len(batch_data) == 0:
-                break
+            # Cycle through data (enables multi-epoch local training)
+            idx = (step * batch_size) % n_samples
+            end = idx + batch_size
+            if end <= n_samples:
+                batch_data   = data[idx:end]
+                batch_labels = labels[idx:end]
+            else:
+                # Wrap around
+                batch_data   = torch.cat([data[idx:], data[:end - n_samples]])
+                batch_labels = torch.cat([labels[idx:], labels[:end - n_samples]])
 
+            optimizer.zero_grad()
             outputs = self.model(batch_data)
             loss    = self.criterion(outputs, batch_labels)
-            loss.backward()  # accumulate gradients
-            valid_steps += 1
+            loss.backward()
+            optimizer.step()
 
-        # Normalise accumulated gradients by actual number of steps run
-        if valid_steps > 1:
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad /= valid_steps
+        # Compute pseudo-gradients: old_weights - new_weights
+        # The controller applies this via SGD(lr=1.0) -> params -= 1.0 * (old - new) -> new
+        pseudo_grads = []
+        for old_p, new_p in zip(old_state, self.model.parameters()):
+            pseudo_grads.append(old_p - new_p.detach())
 
-        grads = []
-        for param in self.model.parameters():
-            grads.append(param.grad.clone() if param.grad is not None else torch.zeros_like(param))
-
-        return grads
+        return pseudo_grads
