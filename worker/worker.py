@@ -23,6 +23,7 @@ from common.serialization import (
     sparsify_gradients
 )
 from trainer import Trainer
+from models import get_model
 
 class WorkerNode:
     def __init__(self, controller_ip="127.0.0.1", controller_port=8000):
@@ -143,8 +144,13 @@ class WorkerNode:
                     self.model_version = task["model_version"]
                 elif update_type == "delta":
                     deltas = decode_gradients(task["delta_gradients"])
-                    for k, d in zip(self.model_state.keys(), deltas):
-                        self.model_state[k] = self.model_state[k].cpu() + d.cpu()
+                    if deltas is not None:
+                        # Instantiate model to map deltas to parameters (ignoring buffers)
+                        temp_model = get_model(self.model_name, self.model_config)
+                        temp_model.load_state_dict(self.model_state)
+                        for param, d in zip(temp_model.parameters(), deltas):
+                            param.data.add_(d.to(param.device))
+                        self.model_state = temp_model.state_dict()
                     self.model_version = task["model_version"]
                 elif update_type == "none":
                     pass # model state is already up to date
