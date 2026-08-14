@@ -3,7 +3,11 @@ import sys
 import time
 import uuid
 import requests
-import psutil
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 import threading
 import queue
 
@@ -18,120 +22,8 @@ from common.serialization import (
     encode_sparse_gradients,
     sparsify_gradients
 )
-from models import get_model
 from trainer import Trainer
-
-# ── ANSI Helpers ──────────────────────────────────────────────────────────────
-
-CLEAR      = "\033[2J"
-HOME       = "\033[H"
-ERASE_LINE = "\033[2K"
-HIDE       = "\033[?25l"
-SHOW       = "\033[?25h"
-BOLD       = "\033[1m"
-DIM        = "\033[2m"
-RESET      = "\033[0m"
-GREEN      = "\033[32m"
-CYAN       = "\033[36m"
-YELLOW     = "\033[33m"
-RED        = "\033[31m"
-WHITE      = "\033[37m"
-
-_ANSI_RE   = __import__('re').compile(r'\033\[[0-9;]*m')
-_prev_lines = [0]  # mutable container to track previous frame line count
-
-
-
-def _render_worker(state: dict):
-    """Render a compact worker status panel."""
-    W = 56
-    inner = W - 4
-
-    lines = []
-
-    def hr_top():
-        lines.append(f"  {CYAN}╔{'═' * (W - 2)}╗{RESET}")
-    def hr_mid():
-        lines.append(f"  {CYAN}╠{'═' * (W - 2)}╣{RESET}")
-    def hr_bot():
-        lines.append(f"  {CYAN}╚{'═' * (W - 2)}╝{RESET}")
-    def row(text: str):
-        plain = _ANSI_RE.sub('', text)
-        pad = inner - len(plain)
-        if pad < 0: pad = 0
-        lines.append(f"  {CYAN}║{RESET} {text}{' ' * pad} {CYAN}║{RESET}")
-
-    hr_top()
-    title = "Distributed DL — Worker"
-    pad_l = (inner - len(title)) // 2
-    pad_r = inner - len(title) - pad_l
-    lines.append(f"  {CYAN}║{RESET}{' ' * pad_l}{BOLD}{WHITE}{title}{RESET}{' ' * pad_r}  {CYAN}║{RESET}")
-    hr_mid()
-
-    # Connection
-    status = state.get("status", "connecting")
-    if status == "connected":
-        color = GREEN
-        icon = "●"
-    elif status == "training":
-        color = GREEN
-        icon = "●"
-    else:
-        color = YELLOW
-        icon = "○"
-
-    short_id = state.get("worker_id", "—")[:8]
-    row(f"{DIM}Worker{RESET}   {BOLD}{short_id}{RESET}  {color}{icon} {status}{RESET}")
-    row(f"{DIM}Type{RESET}     {state.get('device_type', '—'):<10} {DIM}Cores{RESET} {state.get('cpu_cores', '—')}")
-    row(f"{DIM}Server{RESET}   {state.get('server', '—')}")
-    hr_mid()
-
-    # Training stats
-    row(f"{BOLD}TRAINING{RESET}")
-    model = state.get("model_name", "—")
-    ver   = state.get("model_version", -1)
-    row(f"  {DIM}Model{RESET}      {model}  {DIM}v{RESET}{ver}")
-
-    tasks = state.get("tasks_done", 0)
-    sps   = state.get("samples_per_sec", 0)
-    sps_str = f"{sps:.0f} samp/s" if sps > 0 else "—"
-    row(f"  {DIM}Tasks{RESET}      {tasks:<8} {DIM}Speed{RESET}  {sps_str}")
-
-    bw = state.get("bandwidth", 0)
-    if bw > 1_000_000:
-        bw_str = f"{bw / 1_000_000:.1f} MB/s"
-    elif bw > 1000:
-        bw_str = f"{bw / 1000:.1f} KB/s"
-    else:
-        bw_str = "—"
-    row(f"  {DIM}Bandwidth{RESET}  {bw_str}")
-
-    # Current action
-    action = state.get("action", "Idle")
-    action_color = YELLOW if "Training" in action else CYAN if "Fetching" in action else GREEN if "Sending" in action else DIM
-    row(f"  {DIM}Status{RESET}     {action_color}{action}{RESET}")
-
-    hr_bot()
-
-    # ── Output: single contiguous string, no stray newlines ──
-    out = HIDE
-    if _prev_lines[0] > 0:
-        out += f"\033[{_prev_lines[0]}A\r"
-    for i, line in enumerate(lines):
-        if i > 0:
-            out += "\n"
-        out += f"{ERASE_LINE}{line}"
-    extra = _prev_lines[0] - len(lines)
-    if extra > 0:
-        for _ in range(extra):
-            out += f"\n{ERASE_LINE}"
-        out += f"\033[{extra}A"
-    out += "\n"
-
-    sys.stderr.write(out)
-    sys.stderr.flush()
-    _prev_lines[0] = len(lines)
-
+from models import get_model
 
 class WorkerNode:
     def __init__(self, controller_ip="127.0.0.1", controller_port=8000):
@@ -139,9 +31,13 @@ class WorkerNode:
         self.controller_url = get_controller_url(controller_ip, controller_port)
         
         # System specs
-        self.cpu_cores = psutil.cpu_count(logical=True)
-        self.ram_mb = int(psutil.virtual_memory().total / (1024**2))
-        
+        if HAS_PSUTIL:
+            self.cpu_cores = psutil.cpu_count(logical=True)
+            self.ram_mb = int(psutil.virtual_memory().total / (1024**2))
+        else:
+            self.cpu_cores = os.cpu_count() or 4
+            self.ram_mb = 4096  # Assume 4GB as a safe fallback for mobile
+            
         # Try to infer device type
         if 'TERMUX_VERSION' in os.environ:
             self.device_type = "phone"
@@ -155,32 +51,10 @@ class WorkerNode:
         # Local state tracking for Delta sync
         self.fetch_version = -1
         self.model_version = -1
-        
-        # Model state
-        self.model = None
+        self.model_state = None
         self.model_name = None
         self.model_config = None
-        self.model_state = None
-
-        # Dashboard state
-        self._tasks_done = 0
-        self._ui_state = {
-            "worker_id": self.worker_id,
-            "device_type": self.device_type,
-            "cpu_cores": self.cpu_cores,
-            "server": f"{controller_ip}:{controller_port}",
-            "status": "connecting",
-            "model_name": "—",
-            "model_version": -1,
-            "tasks_done": 0,
-            "samples_per_sec": 0,
-            "bandwidth": 0,
-            "action": "Connecting…",
-        }
-
-    def _render(self):
-        _render_worker(self._ui_state)
-
+        
     def register(self):
         payload = {
             "worker_id": self.worker_id,
@@ -188,18 +62,14 @@ class WorkerNode:
             "ram": self.ram_mb,
             "device_type": self.device_type
         }
-        self._ui_state["action"] = "Registering…"
-        self._render()
+        print(f"[*] Registering worker {self.worker_id}...")
         try:
             r = requests.post(f"{self.controller_url}/register", json=payload)
             r.raise_for_status()
-            self._ui_state["status"] = "connected"
-            self._ui_state["action"] = "Registered ✓"
-            self._render()
+            print("[+] Successfully registered with controller.")
             return True
-        except requests.exceptions.RequestException:
-            self._ui_state["action"] = "Registration failed — retrying"
-            self._render()
+        except requests.exceptions.RequestException as e:
+            print(f"[-] Registration failed: {e}")
             return False
 
     def fetch_task_loop(self, task_queue):
@@ -225,7 +95,6 @@ class WorkerNode:
                 download_time = time.time() - req_start_time
                 payload_size = len(r.content)
                 self.bandwidth = payload_size / max(download_time, 0.001)
-                self._ui_state["bandwidth"] = self.bandwidth
                 
                 task = r.json()
                 if "model_version" in task:
@@ -235,24 +104,25 @@ class WorkerNode:
                 
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 400 and "complete" in e.response.text:
+                    print("[i] Training complete. Fetch thread exiting.")
                     task_queue.put({"type": "DONE"})
                     break
+                print(f"[!] Fetch HTTP error: {e}")
                 time.sleep(2)
-            except requests.exceptions.RequestException:
-                self._ui_state["action"] = "Connection lost — retrying"
-                self._render()
+            except requests.exceptions.RequestException as e:
+                print(f"[!] Fetch Communication error: {e}")
                 time.sleep(2)
-            except Exception:
+            except Exception as e:
+                print(f"[!] Fetch Unexpected error: {e}")
                 time.sleep(2)
 
     def run(self):
         # Register first
         while not self.register():
+            print("Retrying registration in 5 seconds...")
             time.sleep(5)
             
-        self._ui_state["status"] = "training"
-        self._ui_state["action"] = "Waiting for first task…"
-        self._render()
+        print("[*] Starting training loop...")
         
         task_queue = queue.Queue(maxsize=2)
         fetch_thread = threading.Thread(target=self.fetch_task_loop, args=(task_queue,), daemon=True)
@@ -262,11 +132,6 @@ class WorkerNode:
                 # 1. Get Task from Queue (blocks until available)
                 task = task_queue.get()
                 if "type" in task and task["type"] == "DONE":
-                    self._ui_state["action"] = "Training complete ✓"
-                    self._ui_state["status"] = "done"
-                    self._render()
-                    sys.stderr.write(SHOW)
-                    sys.stderr.flush()
                     break
                     
                 update_type = task.get("model_update_type", "full")
@@ -277,14 +142,15 @@ class WorkerNode:
                     self.model_config = task["model_config"]
                     self.model_state  = decode_state_dict(task["model_state"])
                     self.model_version = task["model_version"]
-                    self.model = get_model(self.model_name, self.model_config)
-                    self.model.load_state_dict(self.model_state)
                 elif update_type == "delta":
                     deltas = decode_gradients(task["delta_gradients"])
-                    if deltas is not None and self.model is not None:
-                        for param, d in zip(self.model.parameters(), deltas):
+                    if deltas is not None:
+                        # Instantiate model to map deltas to parameters (ignoring buffers)
+                        temp_model = get_model(self.model_name, self.model_config)
+                        temp_model.load_state_dict(self.model_state)
+                        for param, d in zip(temp_model.parameters(), deltas):
                             param.data.add_(d.to(param.device))
-                        self.model_state = self.model.state_dict()
+                        self.model_state = temp_model.state_dict()
                     self.model_version = task["model_version"]
                 elif update_type == "none":
                     pass # model state is already up to date
@@ -292,29 +158,20 @@ class WorkerNode:
                 data         = decode_tensor(task["data"])
                 labels       = decode_tensor(task["labels"])
                 steps        = task["steps"]
-                lr           = task.get("learning_rate", 0.001)
-
-                self._ui_state["model_name"] = self.model_name or "—"
-                self._ui_state["model_version"] = self.model_version
-                self._ui_state["action"] = f"Training v{self.model_version} ({steps} steps)"
-                self._render()
+                
+                print(f"[>] Training task ({self.model_name}, version {self.model_version}): {steps} steps, {len(data)} samples.")
                 
                 # 2. Local Training — model-agnostic
-                trainer = Trainer(self.model_name, self.model_config, self.model_state, lr=lr)
+                trainer = Trainer(self.model_name, self.model_config, self.model_state)
                 
                 train_start_time = time.time()
                 gradients = trainer.train_steps(data, labels, steps)
                 train_time = time.time() - train_start_time
                 
                 self.samples_per_sec = len(data) / max(train_time, 0.001)
-                self._tasks_done += 1
-
-                self._ui_state["samples_per_sec"] = self.samples_per_sec
-                self._ui_state["tasks_done"] = self._tasks_done
-                self._ui_state["action"] = f"Sending gradients (s={sparsity_ratio:.2f})"
-                self._render()
                 
                 # 3. Send Gradients (Fire and forget via background thread to overlap with next fetch/compute)
+                print(f"[<] Sending gradients for version {self.model_version} (sparsity {sparsity_ratio:.2f})...")
                 sparse_grads = sparsify_gradients(gradients, sparsity_ratio)
                 send_payload = {
                     "worker_id": self.worker_id,
@@ -327,14 +184,13 @@ class WorkerNode:
                 def send_async(payload):
                     try:
                         requests.post(f"{self.controller_url}/send_gradients", json=payload)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[-] Failed sending gradients: {e}")
                         
                 threading.Thread(target=send_async, args=(send_payload,), daemon=True).start()
                 
-            except Exception:
-                self._ui_state["action"] = "Error — retrying"
-                self._render()
+            except Exception as e:
+                print(f"[!] Unexpected error in main loop: {e}")
                 time.sleep(2)
 
 if __name__ == "__main__":
