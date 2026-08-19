@@ -210,6 +210,29 @@ class WorkerNode:
             self._render()
             return False
 
+    def _re_register(self):
+        """Silently re-register with the controller after connection loss.
+
+        Resets fetch_version so the next /get_task returns a full model
+        state dict instead of a delta (the new controller has no history).
+        """
+        try:
+            payload = {
+                "worker_id": self.worker_id,
+                "cpu_cores": self.cpu_cores,
+                "ram": self.ram_mb,
+                "device_type": self.device_type,
+            }
+            r = requests.post(f"{self.controller_url}/register", json=payload, timeout=5)
+            if r.status_code == 200:
+                self.fetch_version = -1  # Force full model sync
+                self.model_version = -1
+                self._ui_state["status"] = "connected"
+                self._ui_state["action"] = "Re-registered ✓"
+                self._render()
+        except Exception:
+            pass  # Will retry on next iteration
+
     def fetch_task_loop(self, task_queue):
         """Background thread that continuously fetches the next task."""
         while True:
@@ -227,7 +250,7 @@ class WorkerNode:
                 }
                 
                 req_start_time = time.time()
-                r = requests.get(f"{self.controller_url}/get_task", params=params)
+                r = requests.get(f"{self.controller_url}/get_task", params=params, timeout=10)
                 r.raise_for_status()
                 
                 download_time = time.time() - req_start_time
@@ -243,13 +266,25 @@ class WorkerNode:
                 
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 400 and "complete" in e.response.text:
-                    task_queue.put({"type": "DONE"})
-                    break
+                    self._ui_state["action"] = "Phase Complete — Waiting for next phase"
+                    self._render()
+                    time.sleep(5)
+                elif e.response.status_code == 401:
+                    # Controller doesn't know us (e.g. restarted), force re-registration
+                    self._ui_state["action"] = "Not registered — re-registering"
+                    self._render()
+                    self._re_register()
                 time.sleep(2)
             except requests.exceptions.RequestException:
-                self._ui_state["action"] = "Connection lost — retrying"
+                self._ui_state["action"] = "Connection lost — re-registering"
                 self._render()
                 time.sleep(2)
+                # BUG FIX: Re-register after connection loss.  When the
+                # controller restarts between experiment phases, its
+                # scheduler is empty.  Without re-registration, workers
+                # get auto-registered as device_type='unknown' with
+                # dummy hardware specs, losing all real device info.
+                self._re_register()
             except Exception:
                 time.sleep(2)
 
