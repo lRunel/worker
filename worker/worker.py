@@ -261,6 +261,9 @@ class WorkerNode:
                 task = r.json()
                 if "model_version" in task:
                     self.fetch_version = task["model_version"]
+                
+                # Pass download_time to the training loop for dynamic network buffering
+                task["download_time"] = download_time
                     
                 task_queue.put(task)
                 
@@ -335,6 +338,8 @@ class WorkerNode:
                 data         = decode_tensor(task["data"])
                 labels       = decode_tensor(task["labels"])
                 steps        = task["steps"]
+                time_limit   = task.get("time_limit", 60.0)
+                download_time = task.get("download_time", 0.0)
                 lr           = task.get("learning_rate", 0.001)
 
                 self._ui_state["model_name"] = self.model_name or "—"
@@ -342,11 +347,17 @@ class WorkerNode:
                 self._ui_state["action"] = f"Training v{self.model_version} ({steps} steps)"
                 self._render()
                 
+                # Dynamic Network Buffering:
+                # To ensure the gradient arrives BEFORE the controller's time limit expires,
+                # we must subtract the estimated upload time from the compute time!
+                upload_estimate = download_time * sparsity_ratio
+                compute_time = max(0.1, time_limit - upload_estimate)
+                
                 # 2. Local Training — model-agnostic
                 trainer = Trainer(self.model_name, self.model_config, self.model_state, lr=lr)
                 
                 train_start_time = time.time()
-                gradients = trainer.train_steps(data, labels, steps)
+                gradients, actual_steps = trainer.train_steps(data, labels, steps, time_limit=compute_time)
                 train_time = time.time() - train_start_time
                 
                 self.samples_per_sec = len(data) / max(train_time, 0.001)
@@ -363,7 +374,8 @@ class WorkerNode:
                     "worker_id": self.worker_id,
                     "gradients": encode_sparse_gradients(sparse_grads),
                     "model_version": self.model_version,
-                    "samples_processed": len(data)
+                    "samples_processed": len(data),
+                    "local_steps": actual_steps
                 }
                 
                 # Send in a separate daemon thread so computation on the next task starts instantly
