@@ -16,7 +16,8 @@ class Trainer:
         self.criterion = nn.CrossEntropyLoss()
         self.lr = lr
 
-    def train_steps(self, data: torch.Tensor, labels: torch.Tensor, steps: int):
+    def train_steps(self, data: torch.Tensor, labels: torch.Tensor, steps: int, time_limit: float = 60.0):
+        import time
         self.model.train()
         batch_size = 64  # must match controller
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
@@ -30,6 +31,10 @@ class Trainer:
         old_state = [p.clone().detach() for p in self.model.parameters()]
 
         n_samples = len(data)
+        
+        actual_steps = 0
+        start_time = time.time()
+        
         for step in range(steps):
             # Cycle through data (enables multi-epoch local training)
             idx = (step * batch_size) % n_samples
@@ -47,6 +52,11 @@ class Trainer:
             loss    = self.criterion(outputs, batch_labels)
             loss.backward()
             optimizer.step()
+            actual_steps += 1
+            
+            # Time-Bounded Cutoff (Novelty)
+            if time.time() - start_time >= time_limit:
+                break
 
         # Compute pseudo-gradients: old_weights - new_weights
         # The controller applies this via SGD(lr=1.0) -> params -= 1.0 * (old - new) -> new
@@ -54,4 +64,4 @@ class Trainer:
         for old_p, new_p in zip(old_state, self.model.parameters()):
             pseudo_grads.append(old_p - new_p.detach())
 
-        return pseudo_grads
+        return pseudo_grads, actual_steps
