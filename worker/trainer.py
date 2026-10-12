@@ -10,17 +10,21 @@ from models import get_model
 
 
 class Trainer:
-    def __init__(self, model_name: str, model_config: dict, model_state_dict: dict, lr: float = 0.001):
+    def __init__(self, model_name: str, model_config: dict, model_state_dict: dict, lr: float = 0.001, optimizer_type: str = "adam"):
         self.model = get_model(model_name, model_config)
         self.model.load_state_dict(model_state_dict)
         self.criterion = nn.CrossEntropyLoss()
         self.lr = lr
+        self.optimizer_type = optimizer_type
 
     def train_steps(self, data: torch.Tensor, labels: torch.Tensor, steps: int, time_limit: float = 60.0):
         import time
         self.model.train()
         batch_size = 64  # must match controller
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        if self.optimizer_type.lower() == "sgd":
+            optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
+        else:
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
         # Shuffle received data for better gradient diversity
         perm = torch.randperm(len(data))

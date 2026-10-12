@@ -3,11 +3,7 @@ import sys
 import time
 import uuid
 import requests
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+import psutil
 import threading
 import queue
 
@@ -20,7 +16,8 @@ from common.serialization import (
     decode_tensor, 
     decode_gradients,
     encode_sparse_gradients,
-    sparsify_gradients
+    sparsify_gradients,
+    sparsify_with_error_feedback,
 )
 from models import get_model
 from trainer import Trainer
@@ -87,6 +84,7 @@ def _render_worker(state: dict):
     short_id = state.get("worker_id", "—")[:8]
     row(f"{DIM}Worker{RESET}   {BOLD}{short_id}{RESET}  {color}{icon} {status}{RESET}")
     row(f"{DIM}Type{RESET}     {state.get('device_type', '—'):<10} {DIM}Cores{RESET} {state.get('cpu_cores', '—')}")
+    row(f"{DIM}Profile{RESET}  {state.get('resource_profile', '—'):<10} {DIM}Points{RESET} {state.get('points', 0):.2f}")
     row(f"{DIM}Server{RESET}   {state.get('server', '—')}")
     hr_mid()
 
@@ -143,13 +141,9 @@ class WorkerNode:
         self.controller_url = get_controller_url(controller_ip, controller_port)
         
         # System specs
-        if HAS_PSUTIL:
-            self.cpu_cores = psutil.cpu_count(logical=True)
-            self.ram_mb = int(psutil.virtual_memory().total / (1024**2))
-        else:
-            self.cpu_cores = os.cpu_count() or 4
-            self.ram_mb = 4096  # Assume 4GB as a safe fallback for mobile
-            
+        self.cpu_cores = psutil.cpu_count(logical=True)
+        self.ram_mb = int(psutil.virtual_memory().total / (1024**2))
+        
         # Try to infer device type
         if 'TERMUX_VERSION' in os.environ:
             self.device_type = "phone"
@@ -169,6 +163,10 @@ class WorkerNode:
         self.model_name = None
         self.model_config = None
         self.model_state = None
+        self.residuals = None  # Error feedback buffer for Top-K gradient compression
+
+        self.resource_profile = os.getenv("RESOURCE_PROFILE", "Medium")
+        self.current_points = 0.0
 
         # Dashboard state
         self._tasks_done = 0
@@ -184,6 +182,8 @@ class WorkerNode:
             "samples_per_sec": 0,
             "bandwidth": 0,
             "action": "Connecting…",
+            "resource_profile": self.resource_profile,
+            "points": self.current_points,
         }
 
     def _render(self):
@@ -246,7 +246,8 @@ class WorkerNode:
                     "worker_id": self.worker_id,
                     "samples_per_sec": self.samples_per_sec,
                     "bandwidth": self.bandwidth,
-                    "model_version": self.fetch_version
+                    "model_version": self.fetch_version,
+                    "resource_profile": self.resource_profile,
                 }
                 
                 req_start_time = time.time()
@@ -325,11 +326,22 @@ class WorkerNode:
                     self.model_version = task["model_version"]
                     self.model = get_model(self.model_name, self.model_config)
                     self.model.load_state_dict(self.model_state)
+                    self.residuals = None  # Reset error feedback buffer on fresh weights
                 elif update_type == "delta":
                     deltas = decode_gradients(task["delta_gradients"])
                     if deltas is not None and self.model is not None:
                         for param, d in zip(self.model.parameters(), deltas):
                             param.data.add_(d.to(param.device))
+                        if "buffers" in task and task["buffers"]:
+                            try:
+                                buffers = decode_state_dict(task["buffers"])
+                                current_state = self.model.state_dict()
+                                for k, v in buffers.items():
+                                    if k in current_state:
+                                        current_state[k] = v.to(current_state[k].device)
+                                self.model.load_state_dict(current_state)
+                            except Exception:
+                                pass
                         self.model_state = self.model.state_dict()
                     self.model_version = task["model_version"]
                 elif update_type == "none":
@@ -341,26 +353,30 @@ class WorkerNode:
                 time_limit   = task.get("time_limit", 60.0)
                 download_time = task.get("download_time", 0.0)
                 lr           = task.get("learning_rate", 0.001)
+                opt_type     = task.get("optimizer", "adam")
+                batch_size   = task.get("batch_size", 64)
+                self.current_points = task.get("current_points", self.current_points)
 
                 self._ui_state["model_name"] = self.model_name or "—"
                 self._ui_state["model_version"] = self.model_version
+                self._ui_state["points"] = self.current_points
                 self._ui_state["action"] = f"Training v{self.model_version} ({steps} steps)"
                 self._render()
                 
                 # Dynamic Network Buffering:
-                # To ensure the gradient arrives BEFORE the controller's time limit expires,
-                # we must subtract the estimated upload time from the compute time!
                 upload_estimate = download_time * sparsity_ratio
                 compute_time = max(0.1, time_limit - upload_estimate)
                 
                 # 2. Local Training — model-agnostic
-                trainer = Trainer(self.model_name, self.model_config, self.model_state, lr=lr)
+                trainer = Trainer(self.model_name, self.model_config, self.model_state, lr=lr, optimizer_type=opt_type)
                 
                 train_start_time = time.time()
                 gradients, actual_steps = trainer.train_steps(data, labels, steps, time_limit=compute_time)
                 train_time = time.time() - train_start_time
                 
-                self.samples_per_sec = len(data) / max(train_time, 0.001)
+                # Report accurate actual samples processed instead of phantom full len(data)
+                actual_samples = min(len(data), actual_steps * batch_size)
+                self.samples_per_sec = actual_samples / max(train_time, 0.001)
                 self._tasks_done += 1
 
                 self._ui_state["samples_per_sec"] = self.samples_per_sec
@@ -368,13 +384,15 @@ class WorkerNode:
                 self._ui_state["action"] = f"Sending gradients (s={sparsity_ratio:.2f})"
                 self._render()
                 
-                # 3. Send Gradients (Fire and forget via background thread to overlap with next fetch/compute)
-                sparse_grads = sparsify_gradients(gradients, sparsity_ratio)
+                # 3. Send Gradients with Error Feedback Top-K sparsification
+                sparse_grads, self.residuals = sparsify_with_error_feedback(
+                    gradients, self.residuals, sparsity_ratio
+                )
                 send_payload = {
                     "worker_id": self.worker_id,
                     "gradients": encode_sparse_gradients(sparse_grads),
                     "model_version": self.model_version,
-                    "samples_processed": len(data),
+                    "samples_processed": actual_samples,
                     "local_steps": actual_steps
                 }
                 

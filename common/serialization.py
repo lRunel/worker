@@ -38,42 +38,77 @@ def decode_gradients(s: str) -> list[torch.Tensor]:
     buffer = io.BytesIO(b)
     return torch.load(buffer, weights_only=True)
 
+def sparsify_with_error_feedback(
+    grads: list[torch.Tensor],
+    residuals: list[torch.Tensor] | None,
+    sparsity_ratio: float,
+) -> tuple[list[dict], list[torch.Tensor]]:
+    """
+    Compresses gradients using Top-K sparsification with Error Feedback (EF-SGD).
+    Accumulates untransmitted gradient coordinates into residuals so no gradient information is lost.
+
+    Parameters
+    ----------
+    grads          : list of dense gradient tensors
+    residuals      : list of accumulated residual tensors (or None on first round)
+    sparsity_ratio : fraction of coordinates to retain [0.001, 1.0]
+
+    Returns
+    -------
+    sparse_data   : list of dicts for serialization
+    new_residuals : list of updated residual tensors to keep locally for the next round
+    """
+    ratio = max(0.001, min(1.0, float(sparsity_ratio)))
+
+    if residuals is None or len(residuals) != len(grads):
+        residuals = [torch.zeros_like(g) for g in grads]
+
+    if ratio >= 0.99:
+        sparse_data = [{"shape": list(g.shape), "dense": g + r.to(g.device)} for g, r in zip(grads, residuals)]
+        new_residuals = [torch.zeros_like(g) for g in grads]
+        return sparse_data, new_residuals
+
+    sparse_data = []
+    new_residuals = []
+
+    for g, r in zip(grads, residuals):
+        # Accumulate residual into current gradient
+        g_acc = g + r.to(g.device)
+        flat_g = g_acc.flatten()
+        n_elements = flat_g.numel()
+        k = max(1, int(n_elements * ratio))
+
+        if k < n_elements:
+            abs_g = torch.abs(flat_g)
+            _, indices = torch.topk(abs_g, k)
+            actual_values = flat_g[indices]
+
+            sparse_data.append({
+                "shape": list(g.shape),
+                "indices": indices.to(torch.int32),
+                "values": actual_values,
+            })
+
+            # New residual: untransmitted coordinates remain in local memory
+            res_flat = flat_g.clone()
+            res_flat[indices] = 0.0
+            new_residuals.append(res_flat.view(g.shape).detach())
+        else:
+            sparse_data.append({
+                "shape": list(g.shape),
+                "dense": g_acc,
+            })
+            new_residuals.append(torch.zeros_like(g))
+
+    return sparse_data, new_residuals
+
+
 def sparsify_gradients(grads: list[torch.Tensor], sparsity_ratio: float) -> list[dict]:
     """
     Compresses gradients using Top-K sparsification based on the target sparsity ratio.
     Returns a list of dictionaries containing {shape, indices, values}.
     """
-    # Clamp sparsity ratio to valid range (1.0 means 100% kept, 0.01 means 1% kept)
-    ratio = max(0.001, min(1.0, float(sparsity_ratio)))
-    
-    if ratio >= 0.99:
-        # Fast path: no sparsification needed
-        return [{"shape": list(g.shape), "dense": g} for g in grads]
-
-    sparse_data = []
-    for g in grads:
-        flat_g = g.flatten()
-        n_elements = flat_g.numel()
-        k = max(1, int(n_elements * ratio))
-        
-        # Get top-k absolute values
-        abs_g = torch.abs(flat_g)
-        if k < n_elements:
-            # torch.topk is faster than sorting
-            values, indices = torch.topk(abs_g, k)
-            actual_values = flat_g[indices]
-            sparse_data.append({
-                "shape": list(g.shape),
-                "indices": indices.to(torch.int32),
-                "values": actual_values
-            })
-        else:
-            # Fallback to dense if k is large
-            sparse_data.append({
-                "shape": list(g.shape),
-                "dense": g
-            })
-            
+    sparse_data, _ = sparsify_with_error_feedback(grads, None, sparsity_ratio)
     return sparse_data
 
 def desparsify_gradients(sparse_data: list[dict], device: str = "cpu") -> list[torch.Tensor]:
